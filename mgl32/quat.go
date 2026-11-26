@@ -5,6 +5,7 @@
 package mgl32
 
 import (
+	"fmt"
 	"math"
 )
 
@@ -464,4 +465,123 @@ func QuatBetweenVectors(start, dest Vec3) Quat {
 		s * 0.5,
 		axis.Mul(1.0 / s),
 	}
+}
+
+// twistSingularityEpsilon is the threshold below which the length of the
+// (unnormalized) twist quaternion is considered degenerate in SwingTwist.
+// This happens for rotations of (nearly) 180 degrees around an axis (nearly)
+// perpendicular to the twist axis, where no twist is defined.
+const twistSingularityEpsilon = 1e-6
+
+// normalizeSwingTwistAxis returns axis as a unit vector, or an error if it is
+// the zero vector or contains non-finite components.
+func normalizeSwingTwistAxis(axis Vec3) (Vec3, error) {
+	l := axis.Len()
+	if l == 0 || math.IsNaN(float64(l)) || math.IsInf(float64(l), 0) {
+		return Vec3{}, fmt.Errorf("swing/twist decomposition requires a finite, non-zero twist axis, got %v", axis)
+	}
+	return axis.Mul(1 / l), nil
+}
+
+// normalizeSwingTwistQuat returns q as a unit quaternion with a canonical
+// sign (W >= 0, since q and -q describe the same orientation), or an error if
+// q is the zero quaternion or contains non-finite components.
+func normalizeSwingTwistQuat(q Quat) (Quat, error) {
+	l := q.Len()
+	if l == 0 || math.IsNaN(float64(l)) || math.IsInf(float64(l), 0) {
+		return Quat{}, fmt.Errorf("swing/twist decomposition requires a finite, non-zero quaternion, got %v", q)
+	}
+	q = q.Scale(1 / l)
+	if q.W < 0 {
+		q = q.Scale(-1)
+	}
+	return q, nil
+}
+
+// SwingTwist decomposes the rotation represented by q into a "swing" and a
+// "twist" rotation around twistAxis, such that
+//
+//	q = swing.Mul(twist)
+//
+// The twist is the part of the rotation that happens purely around twistAxis
+// (think of a head rotating around the spine), while the swing is the
+// remaining, twist-free part; its rotation axis is perpendicular to
+// twistAxis. This is commonly used to constrain joint rotations, e.g.
+// limiting how far a neck may twist independently of where the head looks.
+//
+// Neither q nor twistAxis need to be normalized; both are normalized
+// internally. Since q and -q describe the same orientation, both yield the
+// same decomposition.
+//
+// Rotations of (nearly) 180 degrees around an axis (nearly) perpendicular to
+// twistAxis have no well-defined twist; in that case the returned twist is
+// the identity and the swing is the whole rotation.
+//
+// An error is returned if q or twistAxis contain non-finite values, if q is
+// the zero quaternion, or if twistAxis is the zero vector.
+func (q Quat) SwingTwist(twistAxis Vec3) (swing, twist Quat, err error) {
+	axis, err := normalizeSwingTwistAxis(twistAxis)
+	if err != nil {
+		return Quat{}, Quat{}, err
+	}
+
+	q, err = normalizeSwingTwistQuat(q)
+	if err != nil {
+		return Quat{}, Quat{}, err
+	}
+
+	// The twist is the rotation whose vector part is the projection of q's
+	// vector part onto the twist axis.
+	twist = Quat{q.W, axis.Mul(q.V.Dot(axis))}
+	if twist.Len() < twistSingularityEpsilon {
+		// A rotation of (almost) 180 degrees around an axis (almost)
+		// perpendicular to the twist axis: the twist is undefined, so treat
+		// it as no twist at all.
+		twist = QuatIdent()
+	} else {
+		twist = twist.Normalize()
+	}
+
+	// q = swing * twist  =>  swing = q * twist^-1, and twist is a unit
+	// quaternion, so its inverse is its conjugate.
+	swing = q.Mul(twist.Conjugate())
+
+	return swing, twist, nil
+}
+
+// SwingTwistClamped decomposes q like SwingTwist, then clamps the twist angle
+// to the interval [minAngle, maxAngle] (in radians), returning the swing and
+// the clamped twist. The limited rotation is recomposed as swing.Mul(twist).
+//
+// The twist angle is signed and lies in (-Pi, Pi]; a positive angle rotates
+// around twistAxis in the sense of QuatRotate. Clamping is therefore also
+// meaningful for asymmetric intervals such as [-Pi/6, Pi/2].
+//
+// An error is returned for the same reasons as SwingTwist, and additionally
+// if minAngle or maxAngle are not finite or minAngle > maxAngle.
+func (q Quat) SwingTwistClamped(twistAxis Vec3, minAngle, maxAngle float32) (swing, twist Quat, err error) {
+	if math.IsNaN(float64(minAngle)) || math.IsInf(float64(minAngle), 0) ||
+		math.IsNaN(float64(maxAngle)) || math.IsInf(float64(maxAngle), 0) {
+		return Quat{}, Quat{}, fmt.Errorf("swing/twist clamp requires finite angle bounds, got [%v, %v]", minAngle, maxAngle)
+	}
+	if minAngle > maxAngle {
+		return Quat{}, Quat{}, fmt.Errorf("swing/twist clamp requires minAngle <= maxAngle, got [%v, %v]", minAngle, maxAngle)
+	}
+
+	swing, twist, err = q.SwingTwist(twistAxis)
+	if err != nil {
+		return Quat{}, Quat{}, err
+	}
+
+	// SwingTwist validated the axis, so this normalize cannot fail.
+	axis, _ := normalizeSwingTwistAxis(twistAxis)
+
+	// The signed angle of the twist around the axis. The twist quaternion
+	// produced by SwingTwist has W >= 0, so this lies in (-Pi, Pi].
+	angle := 2 * float32(math.Atan2(float64(twist.V.Dot(axis)), float64(twist.W)))
+	angle = Clamp(angle, minAngle, maxAngle)
+
+	twist = QuatRotate(angle, axis)
+
+	return swing, twist, nil
 }

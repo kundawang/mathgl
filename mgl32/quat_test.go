@@ -728,3 +728,280 @@ func TestQuatDot(t *testing.T) {
 		}
 	}
 }
+
+func TestQuatSwingTwistPureTwist(t *testing.T) {
+	t.Parallel()
+
+	// A pure 90 degree rotation around Z must decompose into an identity
+	// swing and the full 90 degree twist.
+	axis := Vec3{0, 0, 1}
+	q := QuatRotate(math.Pi/2, axis)
+
+	swing, twist, err := q.SwingTwist(axis)
+	if err != nil {
+		t.Fatalf("SwingTwist returned unexpected error: %v", err)
+	}
+
+	if !swing.OrientationEqualThreshold(QuatIdent(), 1e-5) {
+		t.Errorf("SwingTwist(90 deg around Z) swing != identity (got %v)", swing)
+	}
+	if !twist.OrientationEqualThreshold(q, 1e-5) {
+		t.Errorf("SwingTwist(90 deg around Z) twist != %v (got %v)", q, twist)
+	}
+
+	// The twist angle must be exactly 90 degrees.
+	angle := 2 * float32(math.Atan2(float64(twist.V.Dot(axis)), float64(twist.W)))
+	if !FloatEqualThreshold(angle, math.Pi/2, 1e-5) {
+		t.Errorf("SwingTwist(90 deg around Z) twist angle != Pi/2 (got %v)", angle)
+	}
+}
+
+func TestQuatSwingTwistRecompose(t *testing.T) {
+	t.Parallel()
+
+	axis := Vec3{0, 0, 1}
+	tests := []Quat{
+		QuatIdent(),
+		QuatRotate(math.Pi/2, Vec3{0, 0, 1}),
+		QuatRotate(-2.3, Vec3{0, 0, 1}),
+		QuatRotate(0.9, Vec3{1, 0, 0}),
+		QuatRotate(1.1, Vec3{0, 1, 0}).Mul(QuatRotate(0.7, Vec3{0, 0, 1})),
+		QuatRotate(-0.4, Vec3{1, 1, 0}.Normalize()).Mul(QuatRotate(2.0, Vec3{0, 0, 1})),
+		QuatRotate(2.9, Vec3{1, 2, 3}.Normalize()).Mul(QuatRotate(-1.7, Vec3{3, -2, 1}.Normalize())),
+		// Near 180 degrees around the twist axis itself.
+		QuatRotate(math.Pi-1e-3, Vec3{0, 0, 1}),
+		// Near 180 degrees around an axis perpendicular to the twist axis.
+		QuatRotate(math.Pi-1e-3, Vec3{1, 0, 0}),
+		QuatRotate(math.Pi-1e-3, Vec3{1, 1e-4, 0}.Normalize()),
+	}
+
+	for _, q := range tests {
+		swing, twist, err := q.SwingTwist(axis)
+		if err != nil {
+			t.Errorf("SwingTwist(%v) returned unexpected error: %v", q, err)
+			continue
+		}
+
+		if recomposed := swing.Mul(twist); !recomposed.OrientationEqualThreshold(q, 1e-4) {
+			t.Errorf("SwingTwist(%v) does not recompose (got %v)", q, recomposed)
+		}
+
+		// The twist must rotate purely around the twist axis.
+		if Abs(twist.V[0]) > 1e-5 || Abs(twist.V[1]) > 1e-5 {
+			t.Errorf("SwingTwist(%v) twist %v is not purely around %v", q, twist, axis)
+		}
+
+		// The swing must be twist-free: its rotation axis is perpendicular
+		// to the twist axis.
+		if Abs(swing.V.Dot(axis)) > 1e-4 {
+			t.Errorf("SwingTwist(%v) swing %v is not perpendicular to %v", q, swing, axis)
+		}
+	}
+}
+
+func TestQuatSwingTwistNegatedQuat(t *testing.T) {
+	t.Parallel()
+
+	// q and -q describe the same orientation and must decompose identically.
+	axis := Vec3{0, 0, 1}
+	q := QuatRotate(1.1, Vec3{0, 1, 0}).Mul(QuatRotate(0.7, Vec3{0, 0, 1}))
+
+	swing1, twist1, err := q.SwingTwist(axis)
+	if err != nil {
+		t.Fatalf("SwingTwist returned unexpected error: %v", err)
+	}
+	swing2, twist2, err := q.Scale(-1).SwingTwist(axis)
+	if err != nil {
+		t.Fatalf("SwingTwist returned unexpected error: %v", err)
+	}
+
+	if !swing1.ApproxEqualThreshold(swing2, 1e-5) || !twist1.ApproxEqualThreshold(twist2, 1e-5) {
+		t.Errorf("SwingTwist(q) != SwingTwist(-q): (%v, %v) vs (%v, %v)", swing1, twist1, swing2, twist2)
+	}
+}
+
+func TestQuatSwingTwistAxisAlignment(t *testing.T) {
+	t.Parallel()
+
+	q := QuatRotate(0.8, Vec3{1, 0, 0})
+
+	// Rotation axis parallel to the twist axis: all twist, no swing.
+	swing, twist, err := q.SwingTwist(Vec3{1, 0, 0})
+	if err != nil {
+		t.Fatalf("SwingTwist returned unexpected error: %v", err)
+	}
+	if !swing.OrientationEqualThreshold(QuatIdent(), 1e-5) {
+		t.Errorf("parallel axis: swing != identity (got %v)", swing)
+	}
+	if !twist.OrientationEqualThreshold(q, 1e-5) {
+		t.Errorf("parallel axis: twist != %v (got %v)", q, twist)
+	}
+
+	// Rotation axis perpendicular to the twist axis: all swing, no twist.
+	swing, twist, err = q.SwingTwist(Vec3{0, 0, 1})
+	if err != nil {
+		t.Fatalf("SwingTwist returned unexpected error: %v", err)
+	}
+	if !twist.OrientationEqualThreshold(QuatIdent(), 1e-5) {
+		t.Errorf("perpendicular axis: twist != identity (got %v)", twist)
+	}
+	if !swing.OrientationEqualThreshold(q, 1e-5) {
+		t.Errorf("perpendicular axis: swing != %v (got %v)", q, swing)
+	}
+}
+
+func TestQuatSwingTwistHalfTurnPerpendicular(t *testing.T) {
+	t.Parallel()
+
+	// A 180 degree rotation around an axis perpendicular to the twist axis
+	// has no well-defined twist; expect identity twist and the full rotation
+	// as swing.
+	axis := Vec3{0, 0, 1}
+	q := QuatRotate(math.Pi, Vec3{1, 0, 0})
+
+	swing, twist, err := q.SwingTwist(axis)
+	if err != nil {
+		t.Fatalf("SwingTwist returned unexpected error: %v", err)
+	}
+	if !twist.OrientationEqualThreshold(QuatIdent(), 1e-5) {
+		t.Errorf("180 deg perpendicular: twist != identity (got %v)", twist)
+	}
+	if !swing.OrientationEqualThreshold(q, 1e-5) {
+		t.Errorf("180 deg perpendicular: swing != %v (got %v)", q, swing)
+	}
+}
+
+func TestQuatSwingTwistNonUnitInputs(t *testing.T) {
+	t.Parallel()
+
+	q := QuatRotate(1.1, Vec3{0, 1, 0}).Mul(QuatRotate(0.7, Vec3{0, 0, 1}))
+
+	swing1, twist1, err := q.SwingTwist(Vec3{0, 0, 1})
+	if err != nil {
+		t.Fatalf("SwingTwist returned unexpected error: %v", err)
+	}
+
+	// A scaled (non-unit) quaternion and a non-unit twist axis must give the
+	// same decomposition.
+	swing2, twist2, err := q.Scale(3.7).SwingTwist(Vec3{0, 0, 5})
+	if err != nil {
+		t.Fatalf("SwingTwist returned unexpected error: %v", err)
+	}
+
+	if !swing1.ApproxEqualThreshold(swing2, 1e-4) || !twist1.ApproxEqualThreshold(twist2, 1e-4) {
+		t.Errorf("non-unit inputs changed decomposition: (%v, %v) vs (%v, %v)", swing1, twist1, swing2, twist2)
+	}
+}
+
+func TestQuatSwingTwistErrors(t *testing.T) {
+	t.Parallel()
+
+	q := QuatRotate(0.7, Vec3{0, 0, 1})
+	nan := float32(math.NaN())
+	inf := float32(math.Inf(1))
+
+	quats := []Quat{
+		{0, Vec3{0, 0, 0}},   // zero quaternion
+		{nan, Vec3{0, 0, 0}}, // NaN
+		{1, Vec3{0, inf, 0}}, // Inf
+	}
+	axes := []Vec3{
+		{0, 0, 0},   // zero axis
+		{0, nan, 0}, // NaN
+		{0, 0, inf}, // Inf
+	}
+
+	for _, bad := range quats {
+		if _, _, err := bad.SwingTwist(Vec3{0, 0, 1}); err == nil {
+			t.Errorf("SwingTwist(%v) did not fail", bad)
+		}
+		if _, _, err := bad.SwingTwistClamped(Vec3{0, 0, 1}, -1, 1); err == nil {
+			t.Errorf("SwingTwistClamped(%v) did not fail", bad)
+		}
+	}
+	for _, bad := range axes {
+		if _, _, err := q.SwingTwist(bad); err == nil {
+			t.Errorf("SwingTwist with axis %v did not fail", bad)
+		}
+		if _, _, err := q.SwingTwistClamped(bad, -1, 1); err == nil {
+			t.Errorf("SwingTwistClamped with axis %v did not fail", bad)
+		}
+	}
+
+	// Invalid clamp intervals must fail.
+	if _, _, err := q.SwingTwistClamped(Vec3{0, 0, 1}, 1, -1); err == nil {
+		t.Error("SwingTwistClamped with minAngle > maxAngle did not fail")
+	}
+	if _, _, err := q.SwingTwistClamped(Vec3{0, 0, 1}, nan, 1); err == nil {
+		t.Error("SwingTwistClamped with NaN bound did not fail")
+	}
+	if _, _, err := q.SwingTwistClamped(Vec3{0, 0, 1}, -1, inf); err == nil {
+		t.Error("SwingTwistClamped with infinite bound did not fail")
+	}
+}
+
+func TestQuatSwingTwistClamped(t *testing.T) {
+	t.Parallel()
+
+	axis := Vec3{0, 0, 1}
+	limit := float32(math.Pi / 6) // 30 degrees
+
+	// A pure 90 degree twist clamped to 30 degrees must recompose to exactly
+	// 30 degrees around Z.
+	q := QuatRotate(math.Pi/2, axis)
+	swing, twist, err := q.SwingTwistClamped(axis, -limit, limit)
+	if err != nil {
+		t.Fatalf("SwingTwistClamped returned unexpected error: %v", err)
+	}
+
+	recomposed := swing.Mul(twist)
+	expected := QuatRotate(limit, axis)
+	if !recomposed.OrientationEqualThreshold(expected, 1e-5) {
+		t.Errorf("clamped recomposition != 30 deg around Z (got %v)", recomposed)
+	}
+	if rotated := recomposed.Rotate(Vec3{1, 0, 0}); !rotated.ApproxEqualThreshold(Vec3{0.8660254, 0.5, 0}, 1e-5) {
+		t.Errorf("clamped rotation of (1,0,0) != (cos30, sin30, 0) (got %v)", rotated)
+	}
+
+	// A negative twist clamps to the negative bound.
+	q = QuatRotate(-math.Pi/2, axis)
+	_, twist, err = q.SwingTwistClamped(axis, -limit, limit)
+	if err != nil {
+		t.Fatalf("SwingTwistClamped returned unexpected error: %v", err)
+	}
+	if expected := QuatRotate(-limit, axis); !twist.OrientationEqualThreshold(expected, 1e-5) {
+		t.Errorf("negative twist clamped != -30 deg around Z (got %v)", twist)
+	}
+
+	// A twist inside the interval is left unchanged, and the recomposition
+	// still equals the original rotation.
+	q = QuatRotate(0.9, Vec3{0, 1, 0}).Mul(QuatRotate(0.4, Vec3{0, 0, 1}))
+	swing, twist, err = q.SwingTwistClamped(axis, -limit, limit)
+	if err != nil {
+		t.Fatalf("SwingTwistClamped returned unexpected error: %v", err)
+	}
+	if recomposed := swing.Mul(twist); !recomposed.OrientationEqualThreshold(q, 1e-4) {
+		t.Errorf("in-interval clamp changed the rotation (got %v, want %v)", recomposed, q)
+	}
+
+	// A composite rotation keeps its swing when the twist is clamped: only
+	// the amount of twist around Z changes.
+	q = QuatRotate(0.9, Vec3{0, 1, 0}).Mul(QuatRotate(2.0, Vec3{0, 0, 1}))
+	swing, twist, err = q.SwingTwistClamped(axis, -limit, limit)
+	if err != nil {
+		t.Fatalf("SwingTwistClamped returned unexpected error: %v", err)
+	}
+	fullSwing, _, err := q.SwingTwist(axis)
+	if err != nil {
+		t.Fatalf("SwingTwist returned unexpected error: %v", err)
+	}
+	if !swing.OrientationEqualThreshold(fullSwing, 1e-4) {
+		t.Errorf("clamping changed the swing: %v vs %v", swing, fullSwing)
+	}
+	if expected := QuatRotate(limit, axis); !twist.OrientationEqualThreshold(expected, 1e-5) {
+		t.Errorf("composite twist clamped != 30 deg around Z (got %v)", twist)
+	}
+	if recomposed := swing.Mul(twist); !recomposed.OrientationEqualThreshold(fullSwing.Mul(expected), 1e-4) {
+		t.Errorf("clamped composite recomposition incorrect (got %v)", recomposed)
+	}
+}
