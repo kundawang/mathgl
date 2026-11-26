@@ -7,6 +7,7 @@ package mgl32
 import (
 	"fmt"
 	"math"
+	"sort"
 )
 
 // Circle generates a circle centered at (0,0) with a given radius.
@@ -202,7 +203,7 @@ func MakeBezierCurve3D(numPoints int, cPoints []Vec3) (line []Vec3) {
 // The control point matrix must not be jagged, or this will end up panicking
 // from an index out of bounds exception
 func BezierSurface(u, v float32, cPoints [][]Vec3) Vec3 {
-	if u < 0.0 || u > 1.0 || v < 1.0 || v > 1.0 {
+	if u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0 {
 		panic("u or v not in range [0.0,1.0] in BezierSurface")
 	}
 
@@ -222,6 +223,427 @@ func BezierSurface(u, v float32, cPoints [][]Vec3) Vec3 {
 	}
 
 	return point
+}
+
+// MaxBezierSurfaceTessellationDepth is the hard limit on the number of times a
+// parameter-domain cell is split in half along either axis when tessellating a
+// Bezier surface. It bounds the work and memory used even when the requested
+// maxError is smaller than the surface can represent, so the smallest possible
+// cell spans 1/(1<<MaxBezierSurfaceTessellationDepth) of the parameter domain.
+const MaxBezierSurfaceTessellationDepth = 10
+
+// BezierSurfaceMesh is an error-controlled triangle tessellation of a
+// BezierSurface. It is a vertex pool with parallel slices: Vertices[i] carries
+// UVs[i] and Normals[i].
+//
+// Indices holds independent triangles (three indices per triangle). Vertex
+// indices are stable: identical parameter coordinates always resolve to one
+// shared vertex, so two tessellations of the same surface (or of surfaces
+// stitched together with matching boundary control points) share their
+// boundary vertices exactly and cannot crack. Winding is consistent over the
+// whole mesh: with (u, v) parameterized as usual, triangles face the same
+// direction as the stored normals (+Z for the flat unit XY square).
+//
+// A normal that cannot be defined (a zero-length cross product of the partial
+// derivatives, e.g. on a collapsed or folded patch) is the zero Vec3 rather
+// than a NaN; callers can detect this with Normals[i].LenSqr() == 0.
+type BezierSurfaceMesh struct {
+	Vertices []Vec3
+	UVs      []Vec2
+	Normals  []Vec3
+	Indices  []uint32
+}
+
+// bezierSurfaceTessellator carries the shared state of one tessellation run.
+type bezierSurfaceTessellator struct {
+	cPoints [][]Vec3
+	maxErr  float32
+
+	// leaves maps a quadtree cell key to the cells that survived
+	// subdivision (flat cells and cells at the depth limit).
+	leaves map[uint64]quadCell
+
+	// vertices maps a parameter-domain grid point to its vertex pool index,
+	// guaranteeing one vertex per unique (u, v).
+	vertices map[uint64]int
+
+	// points caches surface evaluations keyed by their parameter pair;
+	// without it the same point would be re-evaluated (with math.Pow at
+	// every control point) each time two cells or stencils touch it.
+	points map[paramPoint]Vec3
+	mesh   BezierSurfaceMesh
+}
+
+// paramPoint is a (u, v) parameter pair used as a cache key.
+type paramPoint struct{ u, v float32 }
+
+// quadCell identifies one square cell of the adaptive quadtree by integer
+// grid coordinates. A cell at depth d covers the parameter square
+// [i/2^d, (i+1)/2^d] x [j/2^d, (j+1)/2^d].
+type quadCell struct {
+	i, j, depth int
+}
+
+// cellKey packs a quadtree cell into a unique uint64. Depth is at most
+// MaxBezierSurfaceTessellationDepth (10), leaving ample room per axis.
+func cellKey(i, j, depth int) uint64 {
+	return uint64(uint32(i))<<32 | uint64(uint32(j))<<8 | uint64(depth)
+}
+
+// TessellateBezierSurface builds an adaptive triangle mesh of the Bezier
+// surface defined by cPoints so that no mesh vertex deviates from the true
+// surface by more than maxError (measured in the units of the control points,
+// as the 3D distance between the sampled midpoint and the bilinear interpolant
+// of the cell corners).
+//
+// Flat regions stay coarse (a perfectly flat surface yields exactly two
+// triangles) while strongly curved regions are recursively split in half
+// along u and v until the error bound is met or
+// MaxBezierSurfaceTessellationDepth is reached. The quadtree is then balanced
+// so neighboring cells differ by at most one depth, and shared edge vertices
+// make the mesh crack-free with uniform winding.
+//
+// The returned BezierSurfaceMesh contains positions, (u, v) parameter
+// coordinates, unit-length surface normals and triangle indices.
+//
+// It panics when:
+//   - cPoints is empty, has fewer than two rows or columns, or is jagged
+//     (rows of different lengths);
+//   - any control point component is NaN or infinite;
+//   - maxError is zero, negative, NaN or infinite.
+//
+// A surface that collapses (e.g. every control point identical, or a folded
+// patch with zero partial derivatives somewhere) tessellates without panicking;
+// only the undefined normals are emitted as the zero Vec3.
+func TessellateBezierSurface(cPoints [][]Vec3, maxError float32) BezierSurfaceMesh {
+	if len(cPoints) < 2 || len(cPoints[0]) < 2 {
+		panic("TessellateBezierSurface: control grid must have at least 2x2 control points")
+	}
+	cols := len(cPoints[0])
+	for row := range cPoints {
+		if len(cPoints[row]) != cols {
+			panic("TessellateBezierSurface: control grid must be rectangular, not jagged")
+		}
+		for _, p := range cPoints[row] {
+			if !isFiniteVec3(p) {
+				panic("TessellateBezierSurface: control points must all be finite")
+			}
+		}
+	}
+	if !(maxError > 0.0) || math.IsInf(float64(maxError), 1) {
+		panic("TessellateBezierSurface: maxError must be a finite, positive number")
+	}
+
+	t := &bezierSurfaceTessellator{
+		cPoints:  cPoints,
+		maxErr:   maxError,
+		leaves:   make(map[uint64]quadCell),
+		vertices: make(map[uint64]int),
+		points:   make(map[paramPoint]Vec3),
+	}
+
+	// Phase 1: adaptive refinement driven by the geometric error.
+	t.refine(quadCell{0, 0, 0})
+	// Phase 2: enforce the 2:1 balance constraint, so no leaf edge borders
+	// cells more than one level finer.
+	t.balance()
+	// Phase 3: emit shared vertices and consistently wound triangles.
+	t.emit()
+
+	return t.mesh
+}
+
+// isFiniteVec3 reports whether every component is neither NaN nor infinite.
+func isFiniteVec3(v Vec3) bool {
+	for _, x := range v {
+		if math.IsNaN(float64(x)) || math.IsInf(float64(x), 0) {
+			return false
+		}
+	}
+	return true
+}
+
+// surfaceAt evaluates the Bezier surface, clamping parameters into [0,1]
+// (BezierSurface panics out of range), checking the result stays finite and
+// memoizing it so shared cell corners and normal stencils are evaluated once.
+func (t *bezierSurfaceTessellator) surfaceAt(u, v float32) Vec3 {
+	u = Clamp(u, 0.0, 1.0)
+	v = Clamp(v, 0.0, 1.0)
+	key := paramPoint{u, v}
+	if p, ok := t.points[key]; ok {
+		return p
+	}
+	p := BezierSurface(u, v, t.cPoints)
+	if !isFiniteVec3(p) {
+		panic("TessellateBezierSurface: surface evaluated to a non-finite point")
+	}
+	t.points[key] = p
+	return p
+}
+
+// refine recursively splits cells whose edge- and center-midpoint samples
+// deviate from the bilinear patch spanned by the cell corners by more than
+// the allowed error. Cells meeting the error bound, and cells at the depth
+// limit, become leaves.
+func (t *bezierSurfaceTessellator) refine(c quadCell) {
+	scale := float32(1.0) / float32(uint32(1)<<uint(c.depth))
+	u0 := float32(c.i) * scale
+	v0 := float32(c.j) * scale
+	u1 := float32(c.i+1) * scale
+	v1 := float32(c.j+1) * scale
+
+	p00 := t.surfaceAt(u0, v0)
+	p10 := t.surfaceAt(u1, v0)
+	p11 := t.surfaceAt(u1, v1)
+	p01 := t.surfaceAt(u0, v1)
+
+	um := (u0 + u1) * 0.5
+	vm := (v0 + v1) * 0.5
+
+	// Bilinear interpolant of the four corners at (su, sv) in [0,1]^2.
+	linear := func(su, sv float32) Vec3 {
+		bottom := p00.Add(p10.Sub(p00).Mul(su))
+		top := p01.Add(p11.Sub(p01).Mul(su))
+		return bottom.Add(top.Sub(bottom).Mul(sv))
+	}
+
+	// Five interior samples: four edge midpoints and the cell center.
+	samples := [5]struct {
+		u, v float32
+	}{
+		{um, v0}, {u1, vm}, {um, v1}, {u0, vm}, {um, vm},
+	}
+	flat := true
+	for _, s := range samples {
+		su := (s.u - u0) / (u1 - u0)
+		sv := (s.v - v0) / (v1 - v0)
+		if t.surfaceAt(s.u, s.v).Sub(linear(su, sv)).Len() > t.maxErr {
+			flat = false
+			break
+		}
+	}
+
+	if flat || c.depth >= MaxBezierSurfaceTessellationDepth {
+		t.leaves[cellKey(c.i, c.j, c.depth)] = c
+		return
+	}
+
+	next := c.depth + 1
+	t.refine(quadCell{2 * c.i, 2 * c.j, next})
+	t.refine(quadCell{2*c.i + 1, 2 * c.j, next})
+	t.refine(quadCell{2 * c.i, 2*c.j + 1, next})
+	t.refine(quadCell{2*c.i + 1, 2*c.j + 1, next})
+}
+
+// hasFinerNeighbor reports whether any cell adjacent to c across one of its
+// four edges is a leaf more than one level below c. It walks the quadtree
+// down from each half-size neighbor slot: reaching a leaf at any depth below
+// c's means a finer neighbor (reaching c's depth+1 with a leaf is exactly the
+// 2:1 violation).
+func (t *bezierSurfaceTessellator) hasFinerNeighbor(c quadCell) bool {
+	// Half-size (depth+1) cell coordinates touching each edge of c. The two
+	// slots alongside an edge share one fixed axis coordinate.
+	pi, pj := 2*c.i, 2*c.j
+	type slot struct{ i, j int }
+	slots := [8]slot{
+		{pi - 2, pj}, {pi - 2, pj + 1}, // left
+		{pi + 2, pj}, {pi + 2, pj + 1}, // right
+		{pi, pj - 2}, {pi + 1, pj - 2}, // bottom
+		{pi, pj + 2}, {pi + 1, pj + 2}, // top
+	}
+	for _, s := range slots {
+		if s.i < 0 || s.j < 0 {
+			continue // parameter-domain boundary: no neighbor there
+		}
+		i, j := s.i, s.j
+		for depth := c.depth + 1; depth <= MaxBezierSurfaceTessellationDepth; depth++ {
+			if _, ok := t.leaves[cellKey(i, j, depth)]; ok {
+				return true // leaf strictly finer than c
+			}
+			// Descend into the sub-cell that stays under this slot.
+			i *= 2
+			j *= 2
+		}
+	}
+	return false
+}
+
+// balance repeatedly splits leaves violating the 2:1 rule until no leaf has a
+// neighbor two or more levels finer. Splitting one leaf only creates cells at
+// the next depth, and the depth cap bounds the process, so the fixed point is
+// reached after finitely many splits.
+func (t *bezierSurfaceTessellator) balance() {
+	for changed := true; changed; {
+		changed = false
+		for key, c := range t.leaves {
+			if c.depth >= MaxBezierSurfaceTessellationDepth || !t.hasFinerNeighbor(c) {
+				continue
+			}
+			delete(t.leaves, key)
+			next := c.depth + 1
+			children := [4]quadCell{
+				{2 * c.i, 2 * c.j, next},
+				{2*c.i + 1, 2 * c.j, next},
+				{2 * c.i, 2*c.j + 1, next},
+				{2*c.i + 1, 2*c.j + 1, next},
+			}
+			for _, child := range children {
+				t.leaves[cellKey(child.i, child.j, child.depth)] = child
+			}
+			changed = true
+		}
+	}
+}
+
+// emit walks the balanced leaves in deterministic order (depth, then row i,
+// then column j), allocating one vertex per unique parameter point and
+// triangulating each leaf with a uniform winding.
+func (t *bezierSurfaceTessellator) emit() {
+	leaves := make([]quadCell, 0, len(t.leaves))
+	for _, c := range t.leaves {
+		leaves = append(leaves, c)
+	}
+	sort.Slice(leaves, func(a, b int) bool {
+		x, y := leaves[a], leaves[b]
+		return x.depth < y.depth || (x.depth == y.depth &&
+			(x.i < y.i || (x.i == y.i && x.j < y.j)))
+	})
+	for _, c := range leaves {
+		t.emitCell(c)
+	}
+}
+
+// vertex returns the pool index of the vertex at parameter-grid point
+// (i, j, depth), evaluating and caching it on first use.
+func (t *bezierSurfaceTessellator) vertex(i, j, depth int) int {
+	key := cellKey(i, j, depth)
+	if idx, ok := t.vertices[key]; ok {
+		return idx
+	}
+	scale := float32(1.0) / float32(uint32(1)<<uint(depth))
+	u := float32(i) * scale
+	v := float32(j) * scale
+	idx := len(t.mesh.Vertices)
+	t.mesh.Vertices = append(t.mesh.Vertices, t.surfaceAt(u, v))
+	t.mesh.UVs = append(t.mesh.UVs, Vec2{u, v})
+	t.mesh.Normals = append(t.mesh.Normals, t.normalAt(u, v))
+	t.vertices[key] = idx
+	return idx
+}
+
+// emitCell triangulates one balanced leaf. Every triangle is wound so its
+// geometric face normal agrees with the dv x du surface normal used by
+// normalAt (+Z on the flat unit square). Edge midpoint vertices are shared
+// with the finer neighbors across the edge, guaranteeing watertight seams;
+// the optional cell-center vertex is unique to this leaf.
+func (t *bezierSurfaceTessellator) emitCell(c quadCell) {
+	i, j, d := c.i, c.j, c.depth
+
+	// Four corners, CCW in the (u, v) plane starting at (u0, v0).
+	v00 := t.vertex(i, j, d)
+	v10 := t.vertex(i+1, j, d)
+	v11 := t.vertex(i+1, j+1, d)
+	v01 := t.vertex(i, j+1, d)
+
+	// A midpoint exists exactly where a half-size neighbor leaf touches the
+	// edge. In a balanced quadtree there are at most four such edges.
+	next := d + 1
+	var midpoints [4]int // [bottom, right, top, left], -1 when absent
+	for k := range midpoints {
+		midpoints[k] = -1
+	}
+	if d < MaxBezierSurfaceTessellationDepth {
+		pi, pj := 2*i, 2*j
+		if _, ok := t.leaves[cellKey(pi, pj-2, next)]; ok {
+			midpoints[0] = t.vertex(pi+1, pj, next) // bottom edge
+		}
+		if _, ok := t.leaves[cellKey(pi+2, pj, next)]; ok {
+			midpoints[1] = t.vertex(pi+2, pj+1, next) // right edge
+		}
+		if _, ok := t.leaves[cellKey(pi, pj+2, next)]; ok {
+			midpoints[2] = t.vertex(pi+1, pj+2, next) // top edge
+		}
+		if _, ok := t.leaves[cellKey(pi-2, pj, next)]; ok {
+			midpoints[3] = t.vertex(pi, pj+1, next) // left edge
+		}
+	}
+
+	addTri := func(a, b, c int) {
+		t.mesh.Indices = append(t.mesh.Indices, uint32(a), uint32(b), uint32(c))
+	}
+
+	splitEdges := 0
+	for _, m := range midpoints {
+		if m >= 0 {
+			splitEdges++
+		}
+	}
+
+	if splitEdges == 0 {
+		// No finer neighbors: the flat case stays at two triangles.
+		addTri(v00, v11, v10)
+		addTri(v00, v01, v11)
+		return
+	}
+
+	// At least one split edge: insert a cell-center vertex and fan out.
+	// Boundary ring in CCW (u, v) order starting at v00: corner, midpoint,
+	// corner, midpoint, ... Midpoint slots are skipped when that edge is not
+	// split. Triangles use the reversed ring so the geometric face normal
+	// agrees with the dv x du surface normal (+Z on the flat unit square).
+	center := t.vertex(2*i+1, 2*j+1, next)
+	ring := []int{
+		v00, midpoints[0], v10, midpoints[1],
+		v11, midpoints[2], v01, midpoints[3],
+	}
+	var boundary []int
+	for _, idx := range ring {
+		if idx >= 0 {
+			boundary = append(boundary, idx)
+		}
+	}
+	for k := 0; k < len(boundary); k++ {
+		addTri(center, boundary[(k+1)%len(boundary)], boundary[k])
+	}
+}
+
+// normalAt estimates the unit surface normal at (u, v) from central finite
+// differences of the partial derivatives. At the parameter boundaries a
+// one-sided difference replaces the out-of-range sample. A zero cross product
+// (a collapsed or folded surface) yields the zero Vec3, which callers can
+// detect, instead of propagating NaNs.
+func (t *bezierSurfaceTessellator) normalAt(u, v float32) Vec3 {
+	// Fixed stencil: wide enough to dominate float32 rounding yet far below
+	// the coarsest cell size, so the normal follows the local tangent.
+	const h = float32(1.0 / 1024.0)
+
+	du := func() Vec3 {
+		if u+h <= 1.0 {
+			return t.surfaceAt(u+h, v).Sub(t.surfaceAt(Clamp(u-h, 0.0, 1.0), v))
+		}
+		// At the u=1 boundary use a forward difference from u-h to u.
+		return t.surfaceAt(u, v).Sub(t.surfaceAt(Clamp(u-h, 0.0, 1.0), v))
+	}()
+	dv := func() Vec3 {
+		if v+h <= 1.0 {
+			return t.surfaceAt(u, v+h).Sub(t.surfaceAt(u, Clamp(v-h, 0.0, 1.0)))
+		}
+		// At the v=1 boundary use a forward difference from v-h to v.
+		return t.surfaceAt(u, v).Sub(t.surfaceAt(u, Clamp(v-h, 0.0, 1.0)))
+	}()
+
+	// Cross dv x du so the canonical flat unit square (corners at the XY
+	// origin and (1,1,0)) has the +Z normal, matching the outward face used
+	// by the triangle winding below.
+	n := dv.Cross(du)
+	if n.LenSqr() == 0.0 {
+		return Vec3{}
+	}
+	normal := n.Normalize()
+	if !isFiniteVec3(normal) {
+		return Vec3{}
+	}
+	return normal
 }
 
 // BezierSplineInterpolate2D does interpolation over a spline of several bezier
