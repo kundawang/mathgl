@@ -30,6 +30,126 @@ func Perspective(fovy, aspect, near, far float32) Mat4 {
 	return Mat4{float32(f / aspect), 0, 0, 0, 0, float32(f), 0, 0, 0, 0, float32((near + far) / nmf), -1, 0, 0, float32((2. * far * near) / nmf), 0}
 }
 
+// allFinite reports whether every argument is a finite, non-NaN floating
+// point value.
+func allFinite(values ...float32) bool {
+	for _, v := range values {
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			return false
+		}
+	}
+	return true
+}
+
+// PerspectiveReverseZ generates a reverse-Z perspective projection matrix.
+//
+// It shares the left/right and top/bottom frustum extents of Perspective, but
+// maps eye-space depth onto the OpenGL clip-space depth range in the reverse
+// direction: the near plane (eye z = -near) maps to a clip depth of +1 and the
+// far plane (eye z = -far) maps to a clip depth of -1. Keeping the full depth
+// buffer precision near the camera makes this useful together with a floating
+// point depth buffer.
+//
+// near and far are positive distances from the camera, as with Perspective.
+// All parameters must be finite; near must be greater than zero, far must be
+// greater than near, fovy must be between zero and pi (exclusive) and aspect
+// must be greater than zero. If any parameter is invalid, a zero matrix and a
+// non-nil error are returned instead of an invalid projection.
+func PerspectiveReverseZ(fovy, aspect, near, far float32) (Mat4, error) {
+	switch {
+	case !allFinite(fovy, aspect, near, far):
+		return Mat4{}, errors.New("mgl32: PerspectiveReverseZ requires all parameters to be finite")
+	case near <= 0:
+		return Mat4{}, errors.New("mgl32: PerspectiveReverseZ requires a positive near plane")
+	case far <= near:
+		return Mat4{}, errors.New("mgl32: PerspectiveReverseZ requires far to be greater than near")
+	case fovy <= 0 || fovy >= math.Pi:
+		return Mat4{}, errors.New("mgl32: PerspectiveReverseZ requires fovy to be between 0 and pi")
+	case aspect <= 0:
+		return Mat4{}, errors.New("mgl32: PerspectiveReverseZ requires a positive aspect ratio")
+	}
+
+	f := float32(1. / math.Tan(float64(fovy)/2.0))
+
+	return Mat4{
+		f / aspect, 0, 0, 0,
+		0, f, 0, 0,
+		0, 0, float32((near + far) / (far - near)), -1,
+		0, 0, float32((2. * far * near) / (far - near)), 0,
+	}, nil
+}
+
+// PerspectiveReverseZInf generates a reverse-Z perspective projection matrix
+// with an infinitely distant far plane.
+//
+// It is the infinite-far limit of PerspectiveReverseZ: the near plane (eye
+// z = -near) maps to a clip depth of +1 and the depth approaches -1 as eye
+// space depth goes to negative infinity. The left/right and top/bottom
+// frustum extents match those of Perspective.
+//
+// near is a positive distance from the camera. All parameters must be finite;
+// near must be greater than zero, fovy must be between zero and pi (exclusive)
+// and aspect must be greater than zero. If any parameter is invalid, a zero
+// matrix and a non-nil error are returned instead of an invalid projection.
+func PerspectiveReverseZInf(fovy, aspect, near float32) (Mat4, error) {
+	switch {
+	case !allFinite(fovy, aspect, near):
+		return Mat4{}, errors.New("mgl32: PerspectiveReverseZInf requires all parameters to be finite")
+	case near <= 0:
+		return Mat4{}, errors.New("mgl32: PerspectiveReverseZInf requires a positive near plane")
+	case fovy <= 0 || fovy >= math.Pi:
+		return Mat4{}, errors.New("mgl32: PerspectiveReverseZInf requires fovy to be between 0 and pi")
+	case aspect <= 0:
+		return Mat4{}, errors.New("mgl32: PerspectiveReverseZInf requires a positive aspect ratio")
+	}
+
+	f := float32(1. / math.Tan(float64(fovy)/2.0))
+
+	return Mat4{
+		f / aspect, 0, 0, 0,
+		0, f, 0, 0,
+		0, 0, 1, -1,
+		0, 0, 2 * near, 0,
+	}, nil
+}
+
+// OrthoReverseZ generates a reverse-Z orthographic projection matrix.
+//
+// It shares the left/right and top/bottom bounds of Ortho, but maps eye-space
+// depth onto the OpenGL clip-space depth range in the reverse direction: the
+// near plane (eye z = -near) maps to a clip depth of +1 and the far plane
+// (eye z = -far) maps to a clip depth of -1.
+//
+// As with glOrtho and Ortho, near and far are positive plane distances; the
+// planes themselves lie at eye-space z values -near and -far. All parameters
+// must be finite; near must be greater than zero, far must be greater than
+// near, left must differ from right and bottom must differ from top. If any
+// parameter is invalid, a zero matrix and a non-nil error are returned instead
+// of an invalid projection.
+func OrthoReverseZ(left, right, bottom, top, near, far float32) (Mat4, error) {
+	switch {
+	case !allFinite(left, right, bottom, top, near, far):
+		return Mat4{}, errors.New("mgl32: OrthoReverseZ requires all parameters to be finite")
+	case near <= 0:
+		return Mat4{}, errors.New("mgl32: OrthoReverseZ requires a positive near plane")
+	case far <= near:
+		return Mat4{}, errors.New("mgl32: OrthoReverseZ requires far to be greater than near")
+	case left == right:
+		return Mat4{}, errors.New("mgl32: OrthoReverseZ requires left to differ from right")
+	case bottom == top:
+		return Mat4{}, errors.New("mgl32: OrthoReverseZ requires bottom to differ from top")
+	}
+
+	rml, tmb, fmn := (right - left), (top - bottom), (far - near)
+
+	return Mat4{
+		float32(2. / rml), 0, 0, 0,
+		0, float32(2. / tmb), 0, 0,
+		0, 0, float32(2. / fmn), 0,
+		float32(-(right + left) / rml), float32(-(top + bottom) / tmb), float32((far + near) / fmn), 1,
+	}, nil
+}
+
 // Frustum generates a Frustum Matrix.
 func Frustum(left, right, bottom, top, near, far float32) Mat4 {
 	rml, tmb, fmn := (right - left), (top - bottom), (far - near)
