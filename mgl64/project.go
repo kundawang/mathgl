@@ -40,7 +40,7 @@ func LookAt(eyeX, eyeY, eyeZ, centerX, centerY, centerZ, upX, upY, upZ float64) 
 	return LookAtV(Vec3{eyeX, eyeY, eyeZ}, Vec3{centerX, centerY, centerZ}, Vec3{upX, upY, upZ})
 }
 
-//  LookAtV generates a transform matrix from world space into the specific eye space
+// LookAtV generates a transform matrix from world space into the specific eye space
 func LookAtV(eye, center, up Vec3) Mat4 {
 	f := center.Sub(eye).Normalize()
 	s := f.Cross(up.Normalize()).Normalize()
@@ -54,6 +54,96 @@ func LookAtV(eye, center, up Vec3) Mat4 {
 	}
 
 	return M.Mul4(Translate3D(float64(-eye[0]), float64(-eye[1]), float64(-eye[2])))
+}
+
+// StereoPerspective builds a pair of off-axis (asymmetric frustum) stereo
+// cameras from a central "cyclopean" camera pose, following the same
+// right-handed, column-major conventions as LookAtV, Frustum and Perspective.
+//
+// eye, center and up describe the central camera exactly as in LookAtV.
+// eyeSep is the distance between the two eyes (interocular distance); it must
+// be >= 0, and 0 degenerates to a monocular camera identical to
+// LookAtV/Perspective. convDist is the distance from the central camera to
+// the convergence (zero-parallax) plane, measured along the view direction;
+// points on that plane project to the same horizontal position in both eyes.
+// fovy, aspect, near and far are the perspective parameters, as in
+// Perspective.
+//
+// The returned views are parallel (no toe-in): each eye is the central
+// camera translated by +-eyeSep/2 along the camera's right vector, while the
+// projections are horizontally shifted asymmetric frusta chosen so the two
+// frusta coincide exactly on the convergence plane. Simply translating a
+// symmetric projection would give wrong disparities on the convergence plane
+// (and keystone distortion); this construction does not.
+//
+// An error is returned if any parameter is non-finite, eyeSep < 0,
+// convDist <= 0, near <= 0, far <= near, fovy is not in (0, pi),
+// aspect <= 0, or the pose is degenerate (eye == center, zero-length up, or
+// up parallel to the view direction).
+func StereoPerspective(eye, center, up Vec3, eyeSep, convDist, fovy, aspect, near, far float64) (leftView, rightView, leftProj, rightProj Mat4, err error) {
+	fail := func(msg string) (Mat4, Mat4, Mat4, Mat4, error) {
+		return Mat4{}, Mat4{}, Mat4{}, Mat4{}, errors.New(msg)
+	}
+
+	for _, v := range []float64{
+		eye[0], eye[1], eye[2],
+		center[0], center[1], center[2],
+		up[0], up[1], up[2],
+		eyeSep, convDist, fovy, aspect, near, far,
+	} {
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			return fail("StereoPerspective: all parameters must be finite")
+		}
+	}
+	if eyeSep < 0 {
+		return fail("StereoPerspective: eye separation must be >= 0")
+	}
+	if convDist <= 0 {
+		return fail("StereoPerspective: convergence distance must be > 0")
+	}
+	if near <= 0 || far <= near {
+		return fail("StereoPerspective: require 0 < near < far")
+	}
+	if fovy <= 0 || fovy >= float64(math.Pi) {
+		return fail("StereoPerspective: fovy must be in (0, pi)")
+	}
+	if aspect <= 0 {
+		return fail("StereoPerspective: aspect must be > 0")
+	}
+
+	forward := center.Sub(eye)
+	if forward.Len() == 0 {
+		return fail("StereoPerspective: eye and center must differ")
+	}
+	forward = forward.Normalize()
+	if up.Len() == 0 {
+		return fail("StereoPerspective: up must be non-zero")
+	}
+	right := forward.Cross(up)
+	if right.Len() == 0 {
+		return fail("StereoPerspective: up must not be parallel to the view direction")
+	}
+	right = right.Normalize()
+
+	halfSep := eyeSep / 2
+	leftEye := eye.Sub(right.Mul(halfSep))
+	rightEye := eye.Add(right.Mul(halfSep))
+
+	// Parallel views: same orientation as the central camera, translated
+	// along its right vector.
+	leftView = LookAtV(leftEye, leftEye.Add(forward), up)
+	rightView = LookAtV(rightEye, rightEye.Add(forward), up)
+
+	// Off-axis frusta: the symmetric frustum of half-width halfW at the near
+	// plane, shifted horizontally so both eyes' frusta intersect exactly on
+	// the convergence plane.
+	top := near * float64(math.Tan(float64(fovy)/2))
+	halfW := aspect * top
+	shift := near * halfSep / convDist
+	leftProj = Frustum(-halfW+shift, halfW+shift, -top, top, near, far)
+	rightProj = Frustum(-halfW-shift, halfW-shift, -top, top, near, far)
+
+	return leftView, rightView, leftProj, rightProj, nil
 }
 
 // Transform a set of coordinates from object space (in obj) to window coordinates (with depth)

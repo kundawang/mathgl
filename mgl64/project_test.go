@@ -245,3 +245,144 @@ func TestFrustum(t *testing.T) {
 		}
 	}
 }
+
+// ndcX returns the normalized device coordinate x of a world point under the
+// given view and projection matrices.
+func stereoNDCX(p Vec3, view, proj Mat4) float64 {
+	clip := proj.Mul4(view).Mul4x1(p.Vec4(1))
+	return clip[0] / clip[3]
+}
+
+// Fixed reference scene: eye separation 0.06, convergence distance 2.
+func stereoTestScene() (eye, center, up Vec3, eyeSep, convDist, fovy, aspect, near, far float64) {
+	return Vec3{0, 0, 0}, Vec3{0, 0, -1}, Vec3{0, 1, 0},
+		0.06, 2, DegToRad(60), 4.0 / 3.0, 0.1, 100
+}
+
+func TestStereoPerspectiveConvergence(t *testing.T) {
+	t.Parallel()
+
+	eye, center, up, eyeSep, convDist, fovy, aspect, near, far := stereoTestScene()
+	leftView, rightView, leftProj, rightProj, err := StereoPerspective(eye, center, up, eyeSep, convDist, fovy, aspect, near, far)
+	if err != nil {
+		t.Fatalf("StereoPerspective returned error: %v", err)
+	}
+
+	// A target on the convergence plane (deliberately off the view axis in y)
+	// must project to the same horizontal NDC position in both eyes, and to
+	// the same position as under the central monocular camera.
+	target := Vec3{0, 0.3, -2}
+	xl := stereoNDCX(target, leftView, leftProj)
+	xr := stereoNDCX(target, rightView, rightProj)
+	xc := stereoNDCX(target, LookAtV(eye, center, up), Perspective(fovy, aspect, near, far))
+
+	if math.Abs(float64(xl-xr)) > 1e-5 {
+		t.Errorf("convergence plane target: left x %v != right x %v", xl, xr)
+	}
+	if math.Abs(float64(xl-xc)) > 1e-5 {
+		t.Errorf("convergence plane target: stereo x %v != central x %v", xl, xc)
+	}
+
+	// Parallax direction: a point nearer than the convergence plane has
+	// crossed disparity (left image x > right image x); a farther point has
+	// uncrossed disparity (left image x < right image x).
+	nearPt := Vec3{0, 0.3, -1}
+	if xl, xr := stereoNDCX(nearPt, leftView, leftProj), stereoNDCX(nearPt, rightView, rightProj); !(xl > xr) {
+		t.Errorf("near point: expected crossed disparity (left x > right x), got left %v right %v", xl, xr)
+	}
+	farPt := Vec3{0, 0.3, -10}
+	if xl, xr := stereoNDCX(farPt, leftView, leftProj), stereoNDCX(farPt, rightView, rightProj); !(xl < xr) {
+		t.Errorf("far point: expected uncrossed disparity (left x < right x), got left %v right %v", xl, xr)
+	}
+}
+
+func TestStereoPerspectiveLeftRightSwap(t *testing.T) {
+	t.Parallel()
+
+	eye, center, up, eyeSep, convDist, fovy, aspect, near, far := stereoTestScene()
+	leftView, rightView, leftProj, rightProj, err := StereoPerspective(eye, center, up, eyeSep, convDist, fovy, aspect, near, far)
+	if err != nil {
+		t.Fatalf("StereoPerspective returned error: %v", err)
+	}
+
+	// The rig is symmetric about the view plane x=0: mirroring a point and
+	// swapping eyes must mirror the projected x coordinate.
+	for _, p := range []Vec3{{0.5, 0.2, -1}, {-0.7, -0.4, -2}, {0.1, 0.9, -10}} {
+		mirror := Vec3{-p[0], p[1], p[2]}
+		xl := stereoNDCX(p, leftView, leftProj)
+		xr := stereoNDCX(mirror, rightView, rightProj)
+		if math.Abs(float64(xl+xr)) > 1e-5 {
+			t.Errorf("swap symmetry failed for %v: left x %v, mirrored right x %v", p, xl, xr)
+		}
+	}
+
+	// The eyes sit at +-eyeSep/2 along the camera's right (+X) axis: each
+	// eye position maps to the origin of its own view space.
+	for i, tc := range []struct {
+		eyePos Vec3
+		view   Mat4
+	}{
+		{Vec3{-0.03, 0, 0}, leftView},
+		{Vec3{0.03, 0, 0}, rightView},
+	} {
+		if o := tc.view.Mul4x1(tc.eyePos.Vec4(1)); !o.Vec3().ApproxEqualThreshold(Vec3{}, 1e-5) {
+			t.Errorf("eye %d: view does not place eye at origin (got %v)", i, o.Vec3())
+		}
+	}
+}
+
+func TestStereoPerspectiveZeroEyeSep(t *testing.T) {
+	t.Parallel()
+
+	eye, center, up, _, _, fovy, aspect, near, far := stereoTestScene()
+	leftView, rightView, leftProj, rightProj, err := StereoPerspective(eye, center, up, 0, 2, fovy, aspect, near, far)
+	if err != nil {
+		t.Fatalf("StereoPerspective returned error: %v", err)
+	}
+
+	monoView := LookAtV(eye, center, up)
+	monoProj := Perspective(fovy, aspect, near, far)
+
+	if !leftView.ApproxEqualThreshold(monoView, 1e-6) || !rightView.ApproxEqualThreshold(monoView, 1e-6) {
+		t.Errorf("zero eye separation: views differ from monocular LookAtV")
+	}
+	if !leftProj.ApproxEqualThreshold(monoProj, 1e-6) || !rightProj.ApproxEqualThreshold(monoProj, 1e-6) {
+		t.Errorf("zero eye separation: projections differ from monocular Perspective")
+	}
+}
+
+func TestStereoPerspectiveErrors(t *testing.T) {
+	t.Parallel()
+
+	eye, center, up, eyeSep, convDist, fovy, aspect, near, far := stereoTestScene()
+	nan := float64(math.NaN())
+	inf := float64(math.Inf(1))
+
+	tests := []struct {
+		Description                          string
+		Eye, Center, Up                      Vec3
+		EyeSep, ConvDist, Fovy, Aspect, N, F float64
+	}{
+		{"NaN eye separation", eye, center, up, nan, convDist, fovy, aspect, near, far},
+		{"infinite convergence", eye, center, up, eyeSep, inf, fovy, aspect, near, far},
+		{"NaN eye", Vec3{nan, 0, 0}, center, up, eyeSep, convDist, fovy, aspect, near, far},
+		{"negative eye separation", eye, center, up, -0.06, convDist, fovy, aspect, near, far},
+		{"zero convergence", eye, center, up, eyeSep, 0, fovy, aspect, near, far},
+		{"negative convergence", eye, center, up, eyeSep, -2, fovy, aspect, near, far},
+		{"zero near", eye, center, up, eyeSep, convDist, fovy, aspect, 0, far},
+		{"far before near", eye, center, up, eyeSep, convDist, fovy, aspect, 10, 1},
+		{"far equals near", eye, center, up, eyeSep, convDist, fovy, aspect, 1, 1},
+		{"zero fovy", eye, center, up, eyeSep, convDist, 0, aspect, near, far},
+		{"fovy of pi", eye, center, up, eyeSep, convDist, float64(math.Pi), aspect, near, far},
+		{"negative aspect", eye, center, up, eyeSep, convDist, fovy, -1, near, far},
+		{"eye equals center", eye, eye, up, eyeSep, convDist, fovy, aspect, near, far},
+		{"zero up", eye, center, Vec3{}, eyeSep, convDist, fovy, aspect, near, far},
+		{"up parallel to view", eye, center, Vec3{0, 0, 1}, eyeSep, convDist, fovy, aspect, near, far},
+	}
+
+	for _, c := range tests {
+		if _, _, _, _, err := StereoPerspective(c.Eye, c.Center, c.Up, c.EyeSep, c.ConvDist, c.Fovy, c.Aspect, c.N, c.F); err == nil {
+			t.Errorf("%v: expected error, got nil", c.Description)
+		}
+	}
+}
